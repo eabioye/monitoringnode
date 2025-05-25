@@ -1,0 +1,130 @@
+#include "main.h"
+#include "html.h"
+#include "wifi.h"
+#include "esp_log.h"
+#include "esp_attr.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "esp_sntp.h"
+#include "esp_sleep.h"
+#include "esp_system.h"
+#include "esp_http_server.h"
+#include "freertos/FreeRTOS.h"
+
+#include <string.h>
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
+#include <esp_err.h>
+#include "lwip/dns.h"
+#include "lwip/ip_addr.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
+#include "esp_netif.h"
+
+#include "sdcard.c"
+#include "pt928.h"
+#include "sensors.h"
+#include "upload.h"
+
+static const char *TAG = "Monitoring-Node";
+
+void go_to_sleep_minutes(int minutes) {
+    ESP_LOGI(TAG, "Sleeping for %d minutes...", minutes);
+    sd_deinit();
+    esp_sleep_enable_timer_wakeup((uint64_t)minutes * 60ULL * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
+bool check_registration(void) {
+    char key[64] = {0};
+    char sensorID[32] = {0};
+    char geoutm[128] = {0};
+
+    esp_err_t err = load_registration_metadata(key, sizeof(key), sensorID, sizeof(sensorID), geoutm, sizeof(geoutm));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Registration metadata not found in NVS");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Loaded registration: key=%s, sensorID=%s, geoutm=%s", key, sensorID, geoutm);
+    sd_set_metadata(key, sensorID, geoutm);
+    return true;
+}
+
+bool check_reed(void){
+    return gpio_get_level(REED_SWITCH_GPIO) == 1;
+}
+
+void configure_reed_switch(void){
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << REED_SWITCH_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE};
+    gpio_config(&io_conf);
+}
+
+void reed_monitor_task(void *arg) {
+    bool last_state = false;
+
+    while (1) {
+        bool current_state = check_reed();
+        if (current_state && !last_state) {
+            ESP_LOGW("REED", "Reed switch activated — disconnecting from Wi-Fi.");
+            esp_wifi_disconnect();
+            wifi_connected = false;
+        }
+
+        last_state = current_state;
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Check every 1 second
+    }
+}
+
+
+void app_main(void)
+{
+    init_nvs();
+    ESP_ERROR_CHECK(nvs_flash_init());
+    configure_reed_switch();
+
+    xTaskCreate(reed_monitor_task, "reed_monitor", 2048, NULL, 5, NULL);
+
+
+    if (sd_init() != ESP_OK) {
+        ESP_LOGE(TAG, "SD init failed. Restarting...");
+        esp_restart();
+    }
+
+    wifi_init_softap();
+    httpd_handle_t server = start_webserver();
+    if (!server) {
+        ESP_LOGE(TAG, "Webserver failed to start");
+    }
+    
+    while (!wifi_connected) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        ESP_LOGI(TAG, "Waiting for Wifi Connection");
+    }
+
+    esp_netif_ip_info_t ip_info;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_get_ip_info(netif, &ip_info);
+    ESP_LOGI("NETIF", "My IP: " IPSTR, IP2STR(&ip_info.ip));
+
+    init_time();
+
+    if (!check_registration()) {
+        ESP_LOGW(TAG, "Registration missing. Awaiting user input.");
+        return;  // Stay awake so the user can open the web page and register
+    }
+
+    int sleep_time = sensor_single_log(payloadpath);
+    try_upload_now();
+    go_to_sleep_minutes(sleep_time);
+}
